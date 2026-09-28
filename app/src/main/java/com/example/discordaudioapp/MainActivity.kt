@@ -1,10 +1,10 @@
 package com.example.discordaudioapp
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.util.Base64
 import android.webkit.*
@@ -14,25 +14,40 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.google.android.material.bottomsheet.BottomSheetBehavior
+import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.InputStream
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private val PICK_AUDIO_REQUEST = 1
+    private val PERMISSION_REQUEST_CODE = 100
 
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        checkPermissions()
-
         webView = findViewById(R.id.webView)
+        val fabSettings = findViewById<FloatingActionButton>(R.id.fabSettings)
+        val bottomSheet = findViewById<android.widget.LinearLayout>(R.id.bottomSheet)
+        val sheetBehavior = BottomSheetBehavior.from(bottomSheet)
+        
+        sheetBehavior.state = BottomSheetBehavior.STATE_HIDDEN
+
+        fabSettings.setOnClickListener {
+            if (sheetBehavior.state == BottomSheetBehavior.STATE_EXPANDED) {
+                sheetBehavior.state = BottomSheetBehavior.STATE_HIDDEN
+            } else {
+                sheetBehavior.state = BottomSheetBehavior.STATE_EXPANDED
+            }
+        }
+
         val volumeBar = findViewById<SeekBar>(R.id.volumeBar)
         val echoBar = findViewById<SeekBar>(R.id.echoBar)
         val btnLoadMp3 = findViewById<Button>(R.id.btnLoadMp3)
-
-        setupWebView()
+        val btnStopMp3 = findViewById<Button>(R.id.btnStopMp3)
 
         volumeBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
@@ -57,8 +72,40 @@ class MainActivity : AppCompatActivity() {
             intent.type = "audio/*"
             startActivityForResult(intent, PICK_AUDIO_REQUEST)
         }
+
+        btnStopMp3.setOnClickListener {
+            webView.evaluateJavascript("if(window.stopMp3Stream) window.stopMp3Stream();", null)
+            Toast.makeText(this, "Oprit MP3", Toast.LENGTH_SHORT).show()
+        }
+
+        checkAndRequestPermissions()
     }
 
+    private fun checkAndRequestPermissions() {
+        val permissions = arrayOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CAMERA,
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        )
+        val missingPermissions = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        
+        if (missingPermissions.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), PERMISSION_REQUEST_CODE)
+        } else {
+            setupWebView()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            setupWebView()
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
         webView.settings.apply {
             javaScriptEnabled = true
@@ -66,12 +113,17 @@ class MainActivity : AppCompatActivity() {
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = true
             allowContentAccess = true
-            userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+            // Premium: Desktop Mode
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            userAgentString = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         }
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest) {
-                request.grant(request.resources)
+                runOnUiThread {
+                    request.grant(request.resources)
+                }
             }
         }
 
@@ -79,6 +131,16 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 injectAudioHook(view)
+                // Also trigger it again slightly later just in case Discord reloads its modules
+                view?.postDelayed({ injectAudioHook(view) }, 2000)
+            }
+            
+            // Inject early as well
+            override fun onLoadResource(view: WebView?, url: String?) {
+                super.onLoadResource(view, url)
+                if (url?.contains("discord.com") == true) {
+                    injectAudioHook(view)
+                }
             }
         }
 
@@ -87,74 +149,82 @@ class MainActivity : AppCompatActivity() {
 
     private fun injectAudioHook(view: WebView?) {
         val js = """
-            (function() {
-                if (window.audioHookInjected) return;
-                window.audioHookInjected = true;
-                
-                const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-                
-                window.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                window.masterGain = window.audioContext.createGain();
-                window.echoDelay = window.audioContext.createDelay();
-                window.echoFeedback = window.audioContext.createGain();
-                window.destNode = window.audioContext.createMediaStreamDestination();
-                
-                window.echoDelay.delayTime.value = 0.3;
-                window.echoFeedback.gain.value = 0.0; // start with 0 echo
-                window.masterGain.gain.value = 1.0; // start with normal volume
-                
-                // Echo routing
-                window.masterGain.connect(window.echoDelay);
-                window.echoDelay.connect(window.echoFeedback);
-                window.echoFeedback.connect(window.echoDelay);
-                window.echoDelay.connect(window.destNode);
-                window.masterGain.connect(window.destNode);
+            try {
+                if (!window.audioHookInjected && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                    window.audioHookInjected = true;
+                    console.log("Injecting Premium Audio Hook!");
+                    
+                    const origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+                    
+                    window.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    window.masterGain = window.audioContext.createGain();
+                    window.echoDelay = window.audioContext.createDelay();
+                    window.echoFeedback = window.audioContext.createGain();
+                    window.destNode = window.audioContext.createMediaStreamDestination();
+                    
+                    window.echoDelay.delayTime.value = 0.3;
+                    window.echoFeedback.gain.value = 0.0;
+                    window.masterGain.gain.value = 1.0;
+                    
+                    window.masterGain.connect(window.echoDelay);
+                    window.echoDelay.connect(window.echoFeedback);
+                    window.echoFeedback.connect(window.echoDelay);
+                    window.echoDelay.connect(window.destNode);
+                    window.masterGain.connect(window.destNode);
 
-                navigator.mediaDevices.getUserMedia = async function(constraints) {
-                    try {
-                        const stream = await origGetUserMedia(constraints);
-                        if (constraints.audio) {
-                            const source = window.audioContext.createMediaStreamSource(stream);
-                            source.connect(window.masterGain);
-                            
-                            // Return the processed stream instead of original
-                            // We need to keep video track if present
-                            const tracks = window.destNode.stream.getAudioTracks();
-                            if(stream.getVideoTracks().length > 0) {
-                                stream.getVideoTracks().forEach(track => window.destNode.stream.addTrack(track));
+                    navigator.mediaDevices.getUserMedia = async function(constraints) {
+                        try {
+                            const stream = await origGetUserMedia(constraints);
+                            if (constraints.audio) {
+                                const source = window.audioContext.createMediaStreamSource(stream);
+                                source.connect(window.masterGain);
+                                
+                                const tracks = window.destNode.stream.getAudioTracks();
+                                if(stream.getVideoTracks().length > 0) {
+                                    stream.getVideoTracks().forEach(track => window.destNode.stream.addTrack(track));
+                                }
+                                return window.destNode.stream;
                             }
-                            return window.destNode.stream;
+                            return stream;
+                        } catch(e) {
+                            return Promise.reject(e);
                         }
-                        return stream;
-                    } catch(e) {
-                        return Promise.reject(e);
-                    }
-                };
+                    };
 
-                window.setAudioVolume = function(val) {
-                    window.masterGain.gain.value = val;
-                };
+                    window.setAudioVolume = function(val) {
+                        if(window.masterGain) window.masterGain.gain.value = val;
+                    };
 
-                window.setAudioEcho = function(val) {
-                    window.echoFeedback.gain.value = val;
-                };
-
-                window.playMp3Stream = function(base64data) {
-                    fetch('data:audio/mp3;base64,' + base64data)
-                    .then(res => res.arrayBuffer())
-                    .then(buf => window.audioContext.decodeAudioData(buf))
-                    .then(audioBuffer => {
+                    window.setAudioEcho = function(val) {
+                        if(window.echoFeedback) window.echoFeedback.gain.value = val;
+                    };
+                    
+                    window.stopMp3Stream = function() {
                         if(window.mp3Source) {
                             window.mp3Source.stop();
+                            window.mp3Source = null;
                         }
-                        window.mp3Source = window.audioContext.createBufferSource();
-                        window.mp3Source.buffer = audioBuffer;
-                        window.mp3Source.loop = true;
-                        window.mp3Source.connect(window.masterGain);
-                        window.mp3Source.start();
-                    });
-                };
-            })();
+                    };
+
+                    window.playMp3Stream = function(base64data) {
+                        fetch('data:audio/mp3;base64,' + base64data)
+                        .then(res => res.arrayBuffer())
+                        .then(buf => window.audioContext.decodeAudioData(buf))
+                        .then(audioBuffer => {
+                            if(window.mp3Source) {
+                                window.mp3Source.stop();
+                            }
+                            window.mp3Source = window.audioContext.createBufferSource();
+                            window.mp3Source.buffer = audioBuffer;
+                            window.mp3Source.loop = true;
+                            window.mp3Source.connect(window.masterGain);
+                            window.mp3Source.start();
+                        });
+                    };
+                }
+            } catch(err) {
+                console.error("Hook error:", err);
+            }
         """.trimIndent()
         view?.evaluateJavascript(js, null)
     }
@@ -169,24 +239,11 @@ class MainActivity : AppCompatActivity() {
                     val bytes = inputStream?.readBytes()
                     val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
                     webView.evaluateJavascript("if(window.playMp3Stream) window.playMp3Stream('$base64');", null)
+                    Toast.makeText(this, "MP3 Incarcat cu succes! Premium!", Toast.LENGTH_SHORT).show()
                 } catch (e: Exception) {
-                    Toast.makeText(this, "Failed to load audio", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Eroare MP3", Toast.LENGTH_SHORT).show()
                 }
             }
-        }
-    }
-
-    private fun checkPermissions() {
-        val permissions = arrayOf(
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.CAMERA,
-            Manifest.permission.READ_EXTERNAL_STORAGE
-        )
-        val missingPermissions = permissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-        if (missingPermissions.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 0)
         }
     }
 }
